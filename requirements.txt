@@ -1,0 +1,8 @@
+streamlit
+pandas
+psycopg2-binary
+matplotlib
+matplotlib-venn
+plotly
+openpyxl
+xlsxwriter
