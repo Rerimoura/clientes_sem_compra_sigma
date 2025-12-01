@@ -120,14 +120,14 @@ def get_clientes_sem_compra(_conn, meses_sem_compra, fornecedores_sel, cidades_s
     WITH ultimas_vendas AS (
         SELECT 
             v.cliente,
-            MAX(v.data_emissao) as data_ultima_compra,
-            (SELECT v2.vendedor FROM vendas v2 WHERE v2.cliente = v.cliente AND v2.data_emissao = MAX(v.data_emissao) LIMIT 1) as ultimo_vendedor_cod
+            v.data_emissao as data_ultima_compra,
+            v.vendedor as ultimo_vendedor_cod,
+            ROW_NUMBER() OVER (PARTITION BY v.cliente ORDER BY v.data_emissao DESC) as rn
         FROM vendas v
         JOIN mercadorias m ON v.mercadoria = m.mercadoria
         WHERE v.vendedor != '2'
         {filtro_vendedor_vendas}
         {filtro_fornecedor}
-        GROUP BY v.cliente
     )
     SELECT 
         c.cliente::int as cliente,
@@ -149,7 +149,8 @@ def get_clientes_sem_compra(_conn, meses_sem_compra, fornecedores_sel, cidades_s
     FROM ultimas_vendas uv
     JOIN clientes c ON uv.cliente = c.cliente
     LEFT JOIN vendedores ven ON uv.ultimo_vendedor_cod::text = ven.vendedor::text
-    WHERE ((EXTRACT(YEAR FROM CURRENT_DATE) - EXTRACT(YEAR FROM uv.data_ultima_compra)) * 12 + 
+    WHERE uv.rn = 1
+    AND ((EXTRACT(YEAR FROM CURRENT_DATE) - EXTRACT(YEAR FROM uv.data_ultima_compra)) * 12 + 
            (EXTRACT(MONTH FROM CURRENT_DATE) - EXTRACT(MONTH FROM uv.data_ultima_compra))) >= {meses_sem_compra}
     {filtro_cidade}
     ORDER BY meses_sem_compra DESC
@@ -158,6 +159,7 @@ def get_clientes_sem_compra(_conn, meses_sem_compra, fornecedores_sel, cidades_s
         return pd.read_sql(query, _conn)
     except Exception as e:
         st.error(f"Erro ao buscar clientes sem compra: {e}")
+        return pd.DataFrame()
 @st.cache_data(ttl=600)
 def get_evolucao_clientes(_conn, fornecedores_sel, cidades_sel, vendedores_sel):
     """
@@ -183,19 +185,34 @@ def get_evolucao_clientes(_conn, fornecedores_sel, cidades_sel, vendedores_sel):
         filtro_fornecedor = f"AND m.nome_fornecedor IN ('{lista_fornecedores}')"
 
     query = f"""
-    SELECT 
-        TO_CHAR(DATE_TRUNC('month', v.data_emissao), 'YYYY-MM-DD') as mes_ref,
-        COUNT(DISTINCT v.cliente) as qtd_clientes
-    FROM vendas v
-    JOIN mercadorias m ON v.mercadoria = m.mercadoria
-    JOIN clientes c ON v.cliente = c.cliente
-    WHERE v.data_emissao >= DATE_TRUNC('year', CURRENT_DATE) -- Apenas ano atual
-    AND v.vendedor != '2'
-    {filtro_vendedor_vendas}
-    {filtro_fornecedor}
-    {filtro_cidade}
-    GROUP BY 1
-    ORDER BY 1
+    WITH vendas_por_cliente AS (
+        SELECT
+            DATE_TRUNC('month', v.data_emissao) as mes_ref,
+            v.cliente,
+            SUM(CASE 
+                WHEN v.tipo = 'V' THEN 
+                    REPLACE(REPLACE(REPLACE(v.valor_liq, 'R$ ', ''), '.', ''), ',', '.')::NUMERIC
+                WHEN v.tipo = 'D' THEN 
+                    -REPLACE(REPLACE(REPLACE(v.valor_liq, 'R$ ', ''), '.', ''), ',', '.')::NUMERIC
+                ELSE 0
+            END) as total_venda
+        FROM vendas v
+        JOIN mercadorias m ON v.mercadoria = m.mercadoria
+        JOIN clientes c ON v.cliente = c.cliente
+        WHERE v.data_emissao >= DATE_TRUNC('year', CURRENT_DATE - INTERVAL '1 year')
+        AND v.vendedor != '2'
+        {filtro_vendedor_vendas}
+        {filtro_fornecedor}
+        {filtro_cidade}
+        GROUP BY DATE_TRUNC('month', v.data_emissao), v.cliente
+    )
+    SELECT
+        TO_CHAR(mes_ref, 'YYYY-MM-DD') as mes_ref,
+        COUNT(DISTINCT cliente) as qtd_clientes_total,
+        COUNT(DISTINCT CASE WHEN total_venda > 0 THEN cliente END) as qtd_clientes_com_venda
+    FROM vendas_por_cliente
+    GROUP BY mes_ref
+    ORDER BY mes_ref;
     """
     try:
         return pd.read_sql(query, _conn)
@@ -216,22 +233,22 @@ def main():
     vendedor_opcoes = ['Todos'] + list(vendedores_dict.values())
 
     with st.container():
-        col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+        col_f1, col_f2, col_f3 = st.columns(3)
         
-        with col_f1:
-            meses_sem_compra = st.number_input("Meses sem compra (mínimo)", min_value=0, value=3, step=1)
+        # meses_sem_compra fixo em 0 conforme solicitado
+        meses_sem_compra = 0
             
-        with col_f2:
+        with col_f1:
             fornecedores_lista = get_fornecedores(conn)
             fornecedores_sel = st.multiselect("Fornecedor", ['Todos'] + fornecedores_lista, default=['Todos'])
             if 'Todos' in fornecedores_sel: fornecedores_sel = ['Todos']
             
-        with col_f3:
+        with col_f2:
             cidades_lista = get_cidades(conn)
             cidades_sel = st.multiselect("Cidade", ['Todas'] + cidades_lista, default=['Todas'])
             if 'Todas' in cidades_sel: cidades_sel = ['Todas']
             
-        with col_f4:
+        with col_f3:
             vendedores_sel_report = st.multiselect("Vendedor", vendedor_opcoes, default=['Todos'])
             
             if 'Todos' in vendedores_sel_report:
@@ -250,39 +267,75 @@ def main():
             
             # Gráfico de Evolução de Clientes Atendidos
             if not df_evolucao.empty:
-                st.markdown("### 📈 Evolução de Clientes Atendidos (Ano Atual)")
-                
                 # Formatar mês para exibição (jan-25, etc)
                 df_evolucao['mes_dt'] = pd.to_datetime(df_evolucao['mes_ref'])
+                
+                # Separar dados por ano
+                ano_atual = datetime.now().year
+                df_ano_atual = df_evolucao[df_evolucao['mes_dt'].dt.year == ano_atual].copy()
+                df_ano_anterior = df_evolucao[df_evolucao['mes_dt'].dt.year == (ano_atual - 1)].copy()
+                
                 # Mapeamento de meses para PT-BR
                 meses_pt = {1: 'jan', 2: 'fev', 3: 'mar', 4: 'abr', 5: 'mai', 6: 'jun', 
                            7: 'jul', 8: 'ago', 9: 'set', 10: 'out', 11: 'nov', 12: 'dez'}
-                df_evolucao['mes_label'] = df_evolucao['mes_dt'].apply(lambda x: f"{meses_pt[x.month]}-{str(x.year)[-2:]}")
                 
-                fig_ev = go.Figure()
-                fig_ev.add_trace(go.Scatter(
-                    x=df_evolucao['mes_label'],
-                    y=df_evolucao['qtd_clientes'],
-                    mode='lines+markers+text',
-                    text=df_evolucao['qtd_clientes'],
-                    textposition="top center",
-                    line=dict(color='royalblue', width=3),
-                    marker=dict(size=8)
-                ))
-                
-                fig_ev.update_layout(
-                    title="Quantidade de Clientes Atendidos por Mês",
-                    xaxis_title="Mês",
-                    yaxis_title="Clientes Atendidos",
-                    height=400,
-                    showlegend=False,
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    yaxis=dict(showgrid=True, gridcolor='lightgray'),
-                    xaxis=dict(showgrid=False)
-                )
-                
-                st.plotly_chart(fig_ev, use_container_width=True)
-                st.markdown("---")
+                # --- Gráfico Ano Anterior ---
+                if not df_ano_anterior.empty:
+                    df_ano_anterior['mes_label'] = df_ano_anterior['mes_dt'].apply(lambda x: f"{meses_pt[x.month]}-{str(x.year)[-2:]}")
+                    
+                    st.markdown("### 📉 Evolução de Clientes Atendidos (Ano Anterior)")
+                    fig_ev_ant = go.Figure()
+                    fig_ev_ant.add_trace(go.Scatter(
+                        x=df_ano_anterior['mes_label'],
+                        y=df_ano_anterior['qtd_clientes_com_venda'],
+                        mode='lines+markers+text',
+                        text=df_ano_anterior['qtd_clientes_com_venda'],
+                        textposition="top center",
+                        line=dict(color='gray', width=3, dash='dot'),
+                        marker=dict(size=8)
+                    ))
+                    
+                    fig_ev_ant.update_layout(
+                        title=f"Quantidade de Clientes Atendidos por Mês ({ano_atual - 1})",
+                        xaxis_title="Mês",
+                        yaxis_title="Clientes Atendidos",
+                        height=400,
+                        showlegend=False,
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        yaxis=dict(showgrid=True, gridcolor='lightgray'),
+                        xaxis=dict(showgrid=False)
+                    )
+                    st.plotly_chart(fig_ev_ant, use_container_width=True)
+                    st.markdown("---")
+
+                # --- Gráfico Ano Atual ---
+                if not df_ano_atual.empty:
+                    df_ano_atual['mes_label'] = df_ano_atual['mes_dt'].apply(lambda x: f"{meses_pt[x.month]}-{str(x.year)[-2:]}")
+                    
+                    st.markdown("### 📈 Evolução de Clientes Atendidos (Ano Atual)")
+                    fig_ev = go.Figure()
+                    fig_ev.add_trace(go.Scatter(
+                        x=df_ano_atual['mes_label'],
+                        y=df_ano_atual['qtd_clientes_com_venda'],
+                        mode='lines+markers+text',
+                        text=df_ano_atual['qtd_clientes_com_venda'],
+                        textposition="top center",
+                        line=dict(color='royalblue', width=3),
+                        marker=dict(size=8)
+                    ))
+                    
+                    fig_ev.update_layout(
+                        title=f"Quantidade de Clientes Atendidos por Mês ({ano_atual})",
+                        xaxis_title="Mês",
+                        yaxis_title="Clientes Atendidos",
+                        height=400,
+                        showlegend=False,
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        yaxis=dict(showgrid=True, gridcolor='lightgray'),
+                        xaxis=dict(showgrid=False)
+                    )
+                    st.plotly_chart(fig_ev, use_container_width=True)
+                    st.markdown("---")
 
             # Gráfico de Barras - Distribuição por Meses sem Compra
             st.markdown("### 📊 Distribuição de Clientes por Meses sem Compra")
